@@ -99,51 +99,53 @@ extern char **environ;
 
 namespace node {
 
-static Persistent<Object> process;
+static __thread Persistent<Object>* process;
 
-static Persistent<String> errno_symbol;
-static Persistent<String> syscall_symbol;
-static Persistent<String> errpath_symbol;
-static Persistent<String> code_symbol;
+static __thread Persistent<String>* errno_symbol;
+static __thread Persistent<String>* syscall_symbol;
+static __thread Persistent<String>* errpath_symbol;
+static __thread Persistent<String>* code_symbol;
 
-static Persistent<String> rss_symbol;
-static Persistent<String> heap_total_symbol;
-static Persistent<String> heap_used_symbol;
+static __thread Persistent<String>* rss_symbol;
+static __thread Persistent<String>* heap_total_symbol;
+static __thread Persistent<String>* heap_used_symbol;
 
-static Persistent<String> listeners_symbol;
-static Persistent<String> uncaught_exception_symbol;
-static Persistent<String> emit_symbol;
+static __thread Persistent<String>* listeners_symbol;
+static __thread Persistent<String>* uncaught_exception_symbol;
+static __thread Persistent<String>* emit_symbol;
 
 
-static char *eval_string = NULL;
-static int option_end_index = 0;
-static bool use_debug_agent = false;
-static bool debug_wait_connect = false;
-static int debug_port=5858;
-static int max_stack_size = 0;
+static __thread char *eval_string = NULL;
+static __thread int option_end_index = 0;
+static __thread bool use_debug_agent = false;
+static __thread bool debug_wait_connect = false;
+static __thread int debug_port=5858;
+static __thread int max_stack_size = 0;
 
-static uv_check_t check_tick_watcher;
-static uv_prepare_t prepare_tick_watcher;
-static uv_idle_t tick_spinner;
-static bool need_tick_cb;
-static Persistent<String> tick_callback_sym;
+static __thread uv_check_t check_tick_watcher;
+static __thread uv_prepare_t prepare_tick_watcher;
+static __thread uv_idle_t tick_spinner;
+static __thread bool need_tick_cb;
+static __thread Persistent<String>* tick_callback_sym;
 
+static __thread Persistent<Object>* binding_cache;
+static __thread Persistent<Array>* module_load_list;
 
 #ifdef OPENSSL_NPN_NEGOTIATED
-static bool use_npn = true;
+static __thread bool use_npn = true;
 #else
-static bool use_npn = false;
+static __thread bool use_npn = false;
 #endif
 
 #ifdef SSL_CTRL_SET_TLSEXT_SERVERNAME_CB
-static bool use_sni = true;
+static __thread bool use_sni = true;
 #else
-static bool use_sni = false;
+static __thread bool use_sni = false;
 #endif
 
 // Buffer for getpwnam_r(), getgrpam_r() and other misc callers; keep this
 // scoped at file-level rather than method-level to avoid excess stack usage.
-static char getbuf[PATH_MAX + 1];
+static __thread char getbuf[PATH_MAX + 1];
 
 // We need to notify V8 when we're idle so that it can run the garbage
 // collector. The interface to this is V8::IdleNotification(). It returns
@@ -152,18 +154,18 @@ static char getbuf[PATH_MAX + 1];
 //
 // A rather convoluted algorithm has been devised to determine when Node is
 // idle. You'll have to figure it out for yourself.
-static uv_check_t gc_check;
-static uv_idle_t gc_idle;
-static uv_timer_t gc_timer;
-bool need_gc;
+static __thread uv_check_t gc_check;
+static __thread uv_idle_t gc_idle;
+static __thread uv_timer_t gc_timer;
+bool __thread need_gc;
 
 
 #define FAST_TICK 700.
 #define GC_WAIT_TIME 5000.
 #define RPM_SAMPLES 100
 #define TICK_TIME(n) tick_times[(tick_time_head - (n)) % RPM_SAMPLES]
-static int64_t tick_times[RPM_SAMPLES];
-static int tick_time_head;
+static __thread int64_t tick_times[RPM_SAMPLES];
+static __thread int tick_time_head;
 
 static void CheckStatus(uv_timer_t* watcher, int status);
 
@@ -216,6 +218,15 @@ static void Check(uv_check_t* watcher, int status) {
 }
 
 
+inline static void LAZY_INIT(Persistent<String>*& ptr, const char* value)
+{
+  if (!ptr)
+    ptr = new Persistent<String>(
+      Persistent<String>::New(
+        String::NewSymbol(value)));
+}
+
+
 static void Tick(void) {
   // Avoid entering a V8 scope.
   if (!need_tick_cb) return;
@@ -228,19 +239,16 @@ static void Tick(void) {
 
   HandleScope scope;
 
-  if (tick_callback_sym.IsEmpty()) {
-    // Lazily set the symbol
-    tick_callback_sym =
-      Persistent<String>::New(String::NewSymbol("_tickCallback"));
-  }
+  if (!tick_callback_sym)
+    tick_callback_sym = NODE_PPSYMBOL("_tickCallback");
 
-  Local<Value> cb_v = process->Get(tick_callback_sym);
+  Local<Value> cb_v = (*process)->Get(*tick_callback_sym);
   if (!cb_v->IsFunction()) return;
   Local<Function> cb = Local<Function>::Cast(cb_v);
 
   TryCatch try_catch;
 
-  cb->Call(process, 0, NULL);
+  cb->Call(*process, 0, NULL);
 
   if (try_catch.HasCaught()) {
     FatalException(try_catch);
@@ -773,11 +781,11 @@ Local<Value> ErrnoException(int errorno,
   Local<String> cons1 = String::Concat(estring, String::NewSymbol(", "));
   Local<String> cons2 = String::Concat(cons1, message);
 
-  if (syscall_symbol.IsEmpty()) {
-    syscall_symbol = NODE_PSYMBOL("syscall");
-    errno_symbol = NODE_PSYMBOL("errno");
-    errpath_symbol = NODE_PSYMBOL("path");
-    code_symbol = NODE_PSYMBOL("code");
+  if (!syscall_symbol) {
+    syscall_symbol = NODE_PPSYMBOL("syscall");
+    errno_symbol = NODE_PPSYMBOL("errno");
+    errpath_symbol = NODE_PPSYMBOL("path");
+    code_symbol = NODE_PPSYMBOL("code");
   }
 
   if (path) {
@@ -791,10 +799,10 @@ Local<Value> ErrnoException(int errorno,
 
   Local<Object> obj = e->ToObject();
 
-  obj->Set(errno_symbol, Integer::New(errorno));
-  obj->Set(code_symbol, estring);
-  if (path) obj->Set(errpath_symbol, String::New(path));
-  if (syscall) obj->Set(syscall_symbol, String::NewSymbol(syscall));
+  obj->Set(*errno_symbol, Integer::New(errorno));
+  obj->Set(*code_symbol, estring);
+  if (path) obj->Set(*errpath_symbol, String::New(path));
+  if (syscall) obj->Set(*syscall_symbol, String::NewSymbol(syscall));
   return e;
 }
 
@@ -889,16 +897,16 @@ void MakeCallback(Handle<Object> object,
 void SetErrno(uv_err_t err) {
   HandleScope scope;
 
-  if (errno_symbol.IsEmpty()) {
-    errno_symbol = NODE_PSYMBOL("errno");
+  if (!errno_symbol) {
+    errno_symbol = NODE_PPSYMBOL("errno");
   }
 
   if (err.code == UV_UNKNOWN) {
     char errno_buf[100];
     snprintf(errno_buf, 100, "Unknown system errno %d", err.sys_errno_);
-    Context::GetCurrent()->Global()->Set(errno_symbol, String::New(errno_buf));
+    Context::GetCurrent()->Global()->Set(*errno_symbol, String::New(errno_buf));
   } else {
-    Context::GetCurrent()->Global()->Set(errno_symbol,
+    Context::GetCurrent()->Global()->Set(*errno_symbol,
                                          String::NewSymbol(uv_err_name(err)));
   }
 }
@@ -1478,20 +1486,20 @@ v8::Handle<v8::Value> MemoryUsage(const v8::Arguments& args) {
 
   Local<Object> info = Object::New();
 
-  if (rss_symbol.IsEmpty()) {
-    rss_symbol = NODE_PSYMBOL("rss");
-    heap_total_symbol = NODE_PSYMBOL("heapTotal");
-    heap_used_symbol = NODE_PSYMBOL("heapUsed");
+  if (!rss_symbol) {
+    rss_symbol = NODE_PPSYMBOL("rss");
+    heap_total_symbol = NODE_PPSYMBOL("heapTotal");
+    heap_used_symbol = NODE_PPSYMBOL("heapUsed");
   }
 
-  info->Set(rss_symbol, Integer::NewFromUnsigned(rss));
+  info->Set(*rss_symbol, Integer::NewFromUnsigned(rss));
 
   // V8 memory usage
   HeapStatistics v8_heap_stats;
   V8::GetHeapStatistics(&v8_heap_stats);
-  info->Set(heap_total_symbol,
+  info->Set(*heap_total_symbol,
             Integer::NewFromUnsigned(v8_heap_stats.total_heap_size()));
-  info->Set(heap_used_symbol,
+  info->Set(*heap_used_symbol,
             Integer::NewFromUnsigned(v8_heap_stats.used_heap_size()));
 
   return scope.Close(info);
@@ -1625,7 +1633,7 @@ static void OnFatalError(const char* location, const char* message) {
   exit(1);
 }
 
-static int uncaught_exception_counter = 0;
+static __thread int uncaught_exception_counter = 0;
 
 void FatalException(TryCatch &try_catch) {
   HandleScope scope;
@@ -1636,20 +1644,20 @@ void FatalException(TryCatch &try_catch) {
     exit(1);
   }
 
-  if (listeners_symbol.IsEmpty()) {
-    listeners_symbol = NODE_PSYMBOL("listeners");
-    uncaught_exception_symbol = NODE_PSYMBOL("uncaughtException");
-    emit_symbol = NODE_PSYMBOL("emit");
+  if (!listeners_symbol) {
+    listeners_symbol = NODE_PPSYMBOL("listeners");
+    uncaught_exception_symbol = NODE_PPSYMBOL("uncaughtException");
+    emit_symbol = NODE_PPSYMBOL("emit");
   }
 
-  Local<Value> listeners_v = process->Get(listeners_symbol);
+  Local<Value> listeners_v = (*process)->Get(*listeners_symbol);
   assert(listeners_v->IsFunction());
 
   Local<Function> listeners = Local<Function>::Cast(listeners_v);
 
-  Local<String> uncaught_exception_symbol_l = Local<String>::New(uncaught_exception_symbol);
-  Local<Value> argv[1] = { uncaught_exception_symbol_l  };
-  Local<Value> ret = listeners->Call(process, 1, argv);
+  Local<String> uncaught_exception_symbol_l = Local<String>::New(*uncaught_exception_symbol);
+  Local<Value> argv[1] = { *uncaught_exception_symbol_l  };
+  Local<Value> ret = listeners->Call(*process, 1, argv);
 
   assert(ret->IsArray());
 
@@ -1663,22 +1671,22 @@ void FatalException(TryCatch &try_catch) {
   }
 
   // Otherwise fire the process "uncaughtException" event
-  Local<Value> emit_v = process->Get(emit_symbol);
+  Local<Value> emit_v = (*process)->Get(*emit_symbol);
   assert(emit_v->IsFunction());
 
   Local<Function> emit = Local<Function>::Cast(emit_v);
 
   Local<Value> error = try_catch.Exception();
-  Local<Value> event_argv[2] = { uncaught_exception_symbol_l, error };
+  Local<Value> event_argv[2] = { *uncaught_exception_symbol_l, error };
 
   uncaught_exception_counter++;
-  emit->Call(process, 2, event_argv);
+  emit->Call(*process, 2, event_argv);
   // Decrement so we know if the next exception is a recursion or not
   uncaught_exception_counter--;
 }
 
 
-static uv_async_t debug_watcher;
+static __thread uv_async_t debug_watcher;
 
 static void DebugMessageCallback(uv_async_t* watcher, int status) {
   HandleScope scope;
@@ -1702,9 +1710,6 @@ static void DebugBreakMessageHandler(const Debug::Message& message) {
 }
 
 
-Persistent<Object> binding_cache;
-Persistent<Array> module_load_list;
-
 static Handle<Value> Binding(const Arguments& args) {
   HandleScope scope;
 
@@ -1712,44 +1717,45 @@ static Handle<Value> Binding(const Arguments& args) {
   String::Utf8Value module_v(module);
   node_module_struct* modp;
 
-  if (binding_cache.IsEmpty()) {
-    binding_cache = Persistent<Object>::New(Object::New());
+  if (!binding_cache) {
+    binding_cache = new Persistent<Object>(
+      Persistent<Object>::New(Object::New()));
   }
 
   Local<Object> exports;
 
-  if (binding_cache->Has(module)) {
-    exports = binding_cache->Get(module)->ToObject();
+  if ((*binding_cache)->Has(module)) {
+    exports = (*binding_cache)->Get(module)->ToObject();
     return scope.Close(exports);
   }
 
   // Append a string to process.moduleLoadList
   char buf[1024];
   snprintf(buf, 1024, "Binding %s", *module_v);
-  uint32_t l = module_load_list->Length();
-  module_load_list->Set(l, String::New(buf));
+  uint32_t l = (*module_load_list)->Length();
+  (*module_load_list)->Set(l, String::New(buf));
 
   if ((modp = get_builtin_module(*module_v)) != NULL) {
     exports = Object::New();
     modp->register_func(exports);
-    binding_cache->Set(module, exports);
+    (*binding_cache)->Set(module, exports);
 
   } else if (!strcmp(*module_v, "constants")) {
     exports = Object::New();
     DefineConstants(exports);
-    binding_cache->Set(module, exports);
+    (*binding_cache)->Set(module, exports);
 
 #ifdef __POSIX__
   } else if (!strcmp(*module_v, "io_watcher")) {
     exports = Object::New();
     IOWatcher::Initialize(exports);
-    binding_cache->Set(module, exports);
+    (*binding_cache)->Set(module, exports);
 #endif
 
   } else if (!strcmp(*module_v, "natives")) {
     exports = Object::New();
     DefineJavaScript(exports);
-    binding_cache->Set(module, exports);
+    (*binding_cache)->Set(module, exports);
 
   } else {
 
@@ -1760,9 +1766,63 @@ static Handle<Value> Binding(const Arguments& args) {
 }
 
 
+static Handle<Value> Print(const Arguments& args) {
+  for (int i = 0; args[i]->IsString(); ++i) {
+    String::Utf8Value s(args[i]);
+    write(1, *s, s.length());
+  }
+  write(1, "\n", 1);
+  return Undefined();
+}
+
+
+static void RunScript(uv_loop_t* loop,
+                      const char* source,
+                      const char* origin) {
+  TryCatch try_catch;
+
+  ScriptOrigin script_origin(String::New(origin));
+
+  Local<Script> script = Script::New(String::New(source), &script_origin);
+  if (script.IsEmpty()) {
+    ReportException(try_catch, true);
+    return;
+  }
+
+  Local<Value> v = script->Run();
+  if (v.IsEmpty()) {
+    ReportException(try_catch, true);
+    return;
+  }
+
+  int r = uv_run(loop);
+  if (r)
+    abort();
+}
+
+
 static void RunIsolate(void* arg) {
   uv_loop_t* loop = uv_loop_new();
   Isolate* isolate = Isolate::New(loop);
+
+  HandleScope scope;
+
+  Persistent<Context> context = Context::New();
+  Context::Scope context_scope(context);
+
+  Local<Object> global = context->Global();
+  NODE_SET_METHOD(global, "print", Print);
+
+  char *argv[] = { "node", "tmp/empty.js", NULL }; // FIXME
+
+  Handle<Object> process = SetupProcessObject(ARRAY_SIZE(argv) - 1, argv);
+//  v8_typed_array::AttachBindings(global); // FIXME
+
+  // Create all the objects, load modules, do everything.
+  // so your next reading stop should be node::Load()!
+  Load(process);
+
+  context.Dispose();
 }
 
 
@@ -1948,28 +2008,30 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
   Local<FunctionTemplate> process_template = FunctionTemplate::New();
 
-  process = Persistent<Object>::New(process_template->GetFunction()->NewInstance());
+  process = new Persistent<Object>(
+    Persistent<Object>::New(process_template->GetFunction()->NewInstance()));
 
 
-  process->SetAccessor(String::New("title"),
-                       ProcessTitleGetter,
-                       ProcessTitleSetter);
+  (*process)->SetAccessor(String::New("title"),
+                          ProcessTitleGetter,
+                          ProcessTitleSetter);
 
   // process.version
-  process->Set(String::NewSymbol("version"), String::New(NODE_VERSION));
+  (*process)->Set(String::NewSymbol("version"), String::New(NODE_VERSION));
 
 #ifdef NODE_PREFIX
   // process.installPrefix
-  process->Set(String::NewSymbol("installPrefix"), String::New(NODE_PREFIX));
+  (*process)->Set(String::NewSymbol("installPrefix"), String::New(NODE_PREFIX));
 #endif
 
   // process.moduleLoadList
-  module_load_list = Persistent<Array>::New(Array::New());
-  process->Set(String::NewSymbol("moduleLoadList"), module_load_list);
+  module_load_list = new Persistent<Array>(
+      Persistent<Array>::New(Array::New()));
+  (*process)->Set(String::NewSymbol("moduleLoadList"), *module_load_list);
 
   Local<Object> versions = Object::New();
   char buf[20];
-  process->Set(String::NewSymbol("versions"), versions);
+  (*process)->Set(String::NewSymbol("versions"), versions);
   // +1 to get rid of the leading 'v'
   versions->Set(String::NewSymbol("node"), String::New(NODE_VERSION+1));
   versions->Set(String::NewSymbol("v8"), String::New(V8::GetVersion()));
@@ -1996,10 +2058,10 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
 
 
   // process.arch
-  process->Set(String::NewSymbol("arch"), String::New(ARCH));
+  (*process)->Set(String::NewSymbol("arch"), String::New(ARCH));
 
   // process.platform
-  process->Set(String::NewSymbol("platform"), String::New(PLATFORM));
+  (*process)->Set(String::NewSymbol("platform"), String::New(PLATFORM));
 
   // process.argv
   Local<Array> arguments = Array::New(argc - option_end_index + 1);
@@ -2009,7 +2071,7 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
     arguments->Set(Integer::New(j), arg);
   }
   // assign it
-  process->Set(String::NewSymbol("argv"), arguments);
+  (*process)->Set(String::NewSymbol("argv"), arguments);
 
   // create process.env
   Local<ObjectTemplate> envTemplate = ObjectTemplate::New();
@@ -2020,63 +2082,63 @@ Handle<Object> SetupProcessObject(int argc, char *argv[]) {
                                        EnvEnumerator,
                                        Undefined());
   Local<Object> env = envTemplate->NewInstance();
-  process->Set(String::NewSymbol("env"), env);
+  (*process)->Set(String::NewSymbol("env"), env);
 
-  process->Set(String::NewSymbol("pid"), Integer::New(getpid()));
-  process->Set(String::NewSymbol("features"), GetFeatures());
+  (*process)->Set(String::NewSymbol("pid"), Integer::New(getpid()));
+  (*process)->Set(String::NewSymbol("features"), GetFeatures());
 
   // -e, --eval
   if (eval_string) {
-    process->Set(String::NewSymbol("_eval"), String::New(eval_string));
+    (*process)->Set(String::NewSymbol("_eval"), String::New(eval_string));
   }
 
   size_t size = 2*PATH_MAX;
   char* execPath = new char[size];
   if (uv_exepath(execPath, &size) != 0) {
     // as a last ditch effort, fallback on argv[0] ?
-    process->Set(String::NewSymbol("execPath"), String::New(argv[0]));
+    (*process)->Set(String::NewSymbol("execPath"), String::New(argv[0]));
   } else {
-    process->Set(String::NewSymbol("execPath"), String::New(execPath, size));
+    (*process)->Set(String::NewSymbol("execPath"), String::New(execPath, size));
   }
   delete [] execPath;
 
 
   // define various internal methods
-  NODE_SET_METHOD(process, "_needTickCallback", NeedTickCallback);
-  NODE_SET_METHOD(process, "reallyExit", Exit);
-  NODE_SET_METHOD(process, "chdir", Chdir);
-  NODE_SET_METHOD(process, "cwd", Cwd);
+  NODE_SET_METHOD(*process, "_needTickCallback", NeedTickCallback);
+  NODE_SET_METHOD(*process, "reallyExit", Exit);
+  NODE_SET_METHOD(*process, "chdir", Chdir);
+  NODE_SET_METHOD(*process, "cwd", Cwd);
 
 #ifdef _WIN32
-  NODE_SET_METHOD(process, "_cwdForDrive", CwdForDrive);
+  NODE_SET_METHOD(*process, "_cwdForDrive", CwdForDrive);
 #endif
 
-  NODE_SET_METHOD(process, "umask", Umask);
+  NODE_SET_METHOD(*process, "umask", Umask);
 
 #ifdef __POSIX__
-  NODE_SET_METHOD(process, "getuid", GetUid);
-  NODE_SET_METHOD(process, "setuid", SetUid);
+  NODE_SET_METHOD(*process, "getuid", GetUid);
+  NODE_SET_METHOD(*process, "setuid", SetUid);
 
-  NODE_SET_METHOD(process, "setgid", SetGid);
-  NODE_SET_METHOD(process, "getgid", GetGid);
+  NODE_SET_METHOD(*process, "setgid", SetGid);
+  NODE_SET_METHOD(*process, "getgid", GetGid);
 #endif // __POSIX__
 
-  NODE_SET_METHOD(process, "_kill", Kill);
+  NODE_SET_METHOD(*process, "_kill", Kill);
 
-  NODE_SET_METHOD(process, "_debugProcess", DebugProcess);
+  NODE_SET_METHOD(*process, "_debugProcess", DebugProcess);
 
-  NODE_SET_METHOD(process, "dlopen", DLOpen);
+  NODE_SET_METHOD(*process, "dlopen", DLOpen);
 
-  NODE_SET_METHOD(process, "uptime", Uptime);
-  NODE_SET_METHOD(process, "memoryUsage", MemoryUsage);
-  NODE_SET_METHOD(process, "uvCounters", UVCounters);
+  NODE_SET_METHOD(*process, "uptime", Uptime);
+  NODE_SET_METHOD(*process, "memoryUsage", MemoryUsage);
+  NODE_SET_METHOD(*process, "uvCounters", UVCounters);
 
-  NODE_SET_METHOD(process, "binding", Binding);
+  NODE_SET_METHOD(*process, "binding", Binding);
 
-  NODE_SET_METHOD(process, "_newIsolate", NewIsolate);
-  NODE_SET_METHOD(process, "_joinIsolate", JoinIsolate);
+  NODE_SET_METHOD(*process, "_newIsolate", NewIsolate);
+  NODE_SET_METHOD(*process, "_joinIsolate", JoinIsolate);
 
-  return process;
+  return *process;
 }
 
 
